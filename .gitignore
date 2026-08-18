@@ -20,7 +20,6 @@ reports/
 run/
 runs/
 dir/
-db/
 *.log
 *.sqlite
 *.sqlite3
