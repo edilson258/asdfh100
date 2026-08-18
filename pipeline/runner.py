@@ -4,6 +4,7 @@ import os
 import queue
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import timedelta
 from pathlib import Path
 from typing import Sequence
@@ -263,6 +264,16 @@ class BatchPipelineOrchestrator:
     # Overlapped pipeline: loader threads -> GPU (main thread) -> postproc
     # threads. This is the part that changed to keep the GPU continuously
     # fed instead of idling through decode/tile/NMS/draw/upload each image.
+    #
+    # PROGRESS BAR FIX: the bar must only advance once an image has fully
+    # finished (postproc + upload done), not merely once it was *submitted*
+    # to the postproc pool. Previously `on_step_done()` was called right
+    # after `postproc_pool.submit(...)`, so the bar reached 100% while a
+    # backlog of NMS/draw/DB/upload work (up to `postproc_backlog_limit`
+    # images) was still running in the background -- looking like a freeze
+    # at 100%. Now `on_step_done()` is only called from inside the postproc
+    # done-callback, i.e. after `_postprocess_and_upload` has actually
+    # returned.
     # ------------------------------------------------------------------
 
     def _process_image_queue(self, run_id: UUID, stats: PipelineProgressStats) -> None:
@@ -285,6 +296,14 @@ class BatchPipelineOrchestrator:
         ) or max(2, min(8, cpu_count))
         window_size = max(2, num_loader_workers * 2)
         postproc_backlog_limit = num_postproc_workers * 4
+
+        # Per-future timeout (seconds) used only when draining the final
+        # backlog, so a stuck upload/DB call doesn't hang the process
+        # forever with no feedback. Configurable via settings; defaults to
+        # 5 minutes per image if not present on PipelineSettings.
+        drain_timeout_s = (
+            getattr(self._settings, "postproc_drain_timeout_s", None) or 300
+        )
 
         task_id = progress.add_task(
             "[cyan]Processing images...", total=stats.total_images
@@ -332,6 +351,10 @@ class BatchPipelineOrchestrator:
                     else:
                         stats.failed_images += 1
                 postproc_backpressure.release()
+                # Advance the bar here -- this is the point at which the
+                # image has *actually* finished (NMS + draw + DB write +
+                # upload), not just been handed off to the postproc pool.
+                on_step_done()
 
             return _callback
 
@@ -378,7 +401,9 @@ class BatchPipelineOrchestrator:
                 loaded = load_future.result()
                 if loaded is None:
                     # Failure already logged and recorded in the DB by
-                    # _load_and_tile_image.
+                    # _load_and_tile_image. This image never reaches
+                    # postproc, so it's the one case where we advance the
+                    # bar directly here.
                     with stats_lock:
                         stats.failed_images += 1
                     on_step_done()
@@ -402,12 +427,16 @@ class BatchPipelineOrchestrator:
                         self._repo.mark_image_failed(img_rec.id, str(exc))
                     with stats_lock:
                         stats.failed_images += 1
+                    # Also terminal for this image without reaching
+                    # postproc, so advance directly.
                     on_step_done()
                     continue
 
                 # Hand NMS + draw + DB write + upload off to the postproc
                 # pool so the GPU can move straight to the next image
-                # instead of waiting on disk/network I/O.
+                # instead of waiting on disk/network I/O. NOTE: on_step_done()
+                # is intentionally NOT called here anymore -- it now happens
+                # inside the callback once postproc actually finishes.
                 postproc_backpressure.acquire()
                 pp_future = postproc_pool.submit(
                     self._postprocess_and_upload, img_rec, raw_detections
@@ -415,12 +444,35 @@ class BatchPipelineOrchestrator:
                 pp_future.add_done_callback(make_postproc_callback())
                 outstanding_postproc.append(pp_future)
 
-                on_step_done()
-
             # Drain any postproc work still in flight before returning so
             # stats/DB state are fully settled when run_pipeline() returns.
+            # This can legitimately take a while (uploads, DB writes), so
+            # log it explicitly instead of leaving the console silent right
+            # after the bar hits 100%.
+            remaining = [f for f in outstanding_postproc if not f.done()]
+            if remaining:
+                logger.info(
+                    f"Draining {len(remaining)} in-flight upload/DB task(s) "
+                    "after inference finished..."
+                )
             for pp_future in outstanding_postproc:
-                pp_future.result()
+                try:
+                    pp_future.result(timeout=drain_timeout_s)
+                except FutureTimeoutError:
+                    logger.error(
+                        "Postproc task exceeded drain timeout "
+                        f"({drain_timeout_s}s) -- likely a stuck upload or DB "
+                        "call. Continuing to drain remaining tasks; this one "
+                        "will be counted via its eventual callback result."
+                    )
+                except Exception as exc:
+                    # Any other exception was already handled/logged inside
+                    # _postprocess_and_upload and reflected via the callback;
+                    # nothing further to do here.
+                    logger.debug(f"Postproc future raised during drain: {exc}")
+
+            if remaining:
+                logger.info("Postproc backlog drained.")
 
     def _create_progress_bar(self) -> Progress:
         """Create Rich progress bar instance."""
