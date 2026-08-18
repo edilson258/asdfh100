@@ -121,6 +121,10 @@ class BatchPipelineOrchestrator:
 
         registered_count = self._repo.register_discovered_images(run_id, discovered)
         stats.total_images = len(discovered)
+        if registered_count and registered_count != len(discovered):
+            logger.info(
+                f"Registered {registered_count:,} new image(s) out of {len(discovered):,} discovered."
+            )
 
         # Estimate tiles by sampling up to N images to avoid reading thousands of files.
         sample_n = min(len(discovered), 50)
@@ -147,14 +151,10 @@ class BatchPipelineOrchestrator:
             avg_tiles_per_image * len(discovered) if avg_tiles_per_image > 0 else 0
         )
 
-        # Use configured max attempts when fetching pending images so we don't retry forever
-        pending_batch = self._repo.fetch_pending_images(
-            run_id,
-            batch_size=len(discovered) or 1,
-            max_attempts=self._settings.max_attempts_per_image,
+        pending_count = self._repo.count_pending_images(
+            run_id, max_attempts=self._settings.max_attempts_per_image
         )
-        pending_count = len(pending_batch)
-        completed_count = stats.total_images - pending_count
+        completed_count = max(0, stats.total_images - pending_count)
 
         # Compute ETA based on sampled average tiles and device capability
         tiles_per_second = 180.0 if torch.cuda.is_available() else 15.0
@@ -182,7 +182,7 @@ class BatchPipelineOrchestrator:
             self._repo.mark_run_status(run_id, "completed")
             return stats
 
-        self._process_image_queue(run_id, stats)
+        self._process_image_queue(run_id, stats, total_images=len(discovered))
         self._repo.mark_run_status(run_id, "completed")
         return stats
 
@@ -276,7 +276,9 @@ class BatchPipelineOrchestrator:
     # returned.
     # ------------------------------------------------------------------
 
-    def _process_image_queue(self, run_id: UUID, stats: PipelineProgressStats) -> None:
+    def _process_image_queue(
+        self, run_id: UUID, stats: PipelineProgressStats, total_images: int
+    ) -> None:
         """Fetch pending images and run them through the pipeline with the
         load, inference, and post-process stages overlapped across images.
         """
@@ -309,21 +311,13 @@ class BatchPipelineOrchestrator:
             "[cyan]Processing images...", total=stats.total_images
         )
 
-        def fetch_pending_iter():
-            """Yield pending ImageRecords in batches from the repository."""
-            while True:
-                with self._repo_lock:
-                    batch = self._repo.fetch_pending_images(
-                        run_id,
-                        batch_size=self._settings.gpu_batch_size,
-                        max_attempts=self._settings.max_attempts_per_image,
-                    )
-                if not batch:
-                    return
-                for rec in batch:
-                    yield rec
-
-        record_iter = fetch_pending_iter()
+        with self._repo_lock:
+            work_items = self._repo.fetch_pending_images(
+                run_id,
+                batch_size=max(total_images, 1),
+                max_attempts=self._settings.max_attempts_per_image,
+            )
+        record_iter = iter(work_items)
         pending_futures: "queue.Queue[Future]" = queue.Queue()
         postproc_backpressure = threading.BoundedSemaphore(postproc_backlog_limit)
         outstanding_postproc: list[Future] = []

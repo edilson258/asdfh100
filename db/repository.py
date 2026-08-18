@@ -119,10 +119,25 @@ class PlantDetectionRepository:
             conn.commit()
             return inserted_count
 
+    def count_pending_images(self, run_id: UUID, max_attempts: int = 5) -> int:
+        """Count images that are still pending for the active run."""
+        query = """
+        SELECT COUNT(*)
+        FROM images
+        WHERE run_id = %s
+          AND status NOT IN ('done', 'failed')
+          AND attempts < %s;
+        """
+        with psycopg.connect(self._database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (run_id, max_attempts))
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+
     def fetch_pending_images(
         self, run_id: UUID, batch_size: int = 100, max_attempts: int = 5
     ) -> list[ImageRecord]:
-        """Query images awaiting processing or retry for the active run.
+        """Fetch a stable batch of runnable images for the active run.
 
         Example:
             >>> images = repo.fetch_pending_images(run_id, batch_size=50)
@@ -132,9 +147,9 @@ class PlantDetectionRepository:
                tiles_total, tiles_done, detections_count, annotated_local_path,
                gcp_url, uploaded, attempts, error_message
         FROM images
-        WHERE (run_id = %s OR run_id IS NULL)
+        WHERE run_id = %s
           AND status NOT IN ('done', 'failed')
-          AND (attempts IS NULL OR attempts < %s)
+          AND attempts < %s
         ORDER BY id ASC
         LIMIT %s;
         """
