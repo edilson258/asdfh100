@@ -315,8 +315,10 @@ class BatchPipelineOrchestrator:
             processed_count += 1
             with progress_lock:
                 progress.update(task_id, advance=1)
+            # if processed_count % self._settings.ram_check_interval_images == 0:
+            #     self._memory.check_and_throttle()
             if processed_count % self._settings.ram_check_interval_images == 0:
-                self._memory.check_and_throttle()
+                self._memory.check_and_log()
 
         def make_postproc_callback() -> "callable[[Future], None]":
             def _callback(fut: Future) -> None:

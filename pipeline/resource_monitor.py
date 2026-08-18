@@ -65,6 +65,10 @@ class MemoryGuardScheduler:
         scaled_batch = int(default_batch_size * headroom_ratio)
         return max(1, scaled_batch)
 
+    def check_and_log(self) -> None:
+        if not self.is_memory_safe():
+            logger.warning("RAM usage is high, but continuing processing.")
+
     def check_and_throttle(self, check_pause_sec: float = 0.5) -> None:
         """Throttle execution loop with micro-pauses if memory exceeds safe ceiling.
 
