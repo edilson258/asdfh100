@@ -20,7 +20,9 @@ class MemoryGuardScheduler:
             >>> guard = MemoryGuardScheduler(max_ram_pct=0.85)
         """
         if not (0.1 <= max_ram_pct <= 0.99):
-            raise ValueError(f"max_ram_pct must be between 0.1 and 0.99, got {max_ram_pct}")
+            raise ValueError(
+                f"max_ram_pct must be between 0.1 and 0.99, got {max_ram_pct}"
+            )
         self._max_ram_pct = max_ram_pct
 
     def get_current_ram_usage_ratio(self) -> float:
@@ -70,6 +72,7 @@ class MemoryGuardScheduler:
             >>> guard.check_and_throttle()
         """
         import time
+
         while not self.is_memory_safe():
             logger.warning(
                 f"RAM usage high ({self.get_current_ram_usage_ratio() * 100:.1f}%). "
