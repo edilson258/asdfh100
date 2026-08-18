@@ -1,0 +1,56 @@
+[project]
+name = "h100-massive-inference"
+version = "0.1.0"
+description = "High-throughput batch plant detection pipeline for RTX 5090 / H100 GPUs with PostgreSQL tracking and GCP upload."
+requires-python = ">=3.11"
+dependencies = [
+    "ultralytics>=8.0.0",
+    "torch>=2.0.0",
+    "psycopg[binary]>=3.1.0",
+    "google-cloud-storage>=2.10.0",
+    "opencv-python-headless>=4.8.0",
+    "pillow>=10.0.0",
+    "numpy>=1.24.0",
+    "psutil>=5.9.0",
+    "loguru>=0.7.0",
+    "rich>=13.0.0",
+    "pydantic-settings>=2.0.0",
+    "typer>=0.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+start = "main:start_cli"
+migrate = "main:migrate_cli"
+clean-db = "main:clean_db_cli"
+clean_gcp = "main:clean_gcp_cli"
+clean-gcp = "main:clean_gcp_cli"
+
+[dependency-groups]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.1.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["main", "config", "logging_setup"]
+packages = ["db", "pipeline"]
+
+[tool.uv]
+package = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]

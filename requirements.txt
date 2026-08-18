@@ -1,0 +1,11 @@
+# Core Python dependencies for h100_massive_inference (torch is installed separately)
+ultralytics
+opencv-python-headless
+google-cloud-storage
+loguru
+rich
+psycopg[binary]
+pydantic-settings
+Pillow
+numpy
+typing_extensions
