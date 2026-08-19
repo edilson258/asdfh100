@@ -316,25 +316,25 @@ class BatchPipelineOrchestrator:
         num_loader_workers = (
             getattr(self._settings, "cpu_preprocess_workers", None)
             or getattr(self._settings, "loader_workers", None)
-            or max(80, min(320, cpu_count * 20))
+            or max(4, min(16, cpu_count * 2))
         )
         num_postproc_workers = (
             getattr(self._settings, "cpu_postprocess_workers", None)
             or getattr(self._settings, "postprocess_workers", None)
-            or max(80, min(240, cpu_count * 10))
+            or max(4, min(12, cpu_count))
         )
-        window_size = max(80, num_loader_workers * 10)
-        postproc_backlog_limit = max(160, num_postproc_workers * 10)
-        gpu_batch_target = max(1, getattr(self._settings, "gpu_batch_size", 640))
+        window_size = max(4, num_loader_workers * 2)
+        postproc_backlog_limit = max(16, num_postproc_workers * 4)
+        gpu_batch_target = max(1, getattr(self._settings, "gpu_batch_size", 256))
         if torch.cuda.is_available():
             try:
                 gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (
                     1024**3
                 )
                 if gpu_mem_gb >= 80:
-                    gpu_batch_target = max(gpu_batch_target, 2560)
+                    gpu_batch_target = max(gpu_batch_target, 512)
                 elif gpu_mem_gb >= 40:
-                    gpu_batch_target = max(gpu_batch_target, 1280)
+                    gpu_batch_target = max(gpu_batch_target, 256)
             except Exception:
                 pass
 

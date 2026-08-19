@@ -105,7 +105,7 @@ class YoloPlantDetectorEngine:
         conf_threshold: float = 0.25,
         iou_threshold: float = 0.45,
         target_classes: Sequence[str] | None = None,
-        batch_size: int = 640,
+        batch_size: int = 256,
     ) -> None:
         """Initialize engine and load model into GPU resident memory.
 
@@ -124,9 +124,9 @@ class YoloPlantDetectorEngine:
                     1024**3
                 )
                 if gpu_mem_gb >= 80:
-                    self._batch_size = max(self._batch_size, 2560)
+                    self._batch_size = max(self._batch_size, 512)
                 elif gpu_mem_gb >= 40:
-                    self._batch_size = max(self._batch_size, 1280)
+                    self._batch_size = max(self._batch_size, 256)
             except Exception:
                 pass
         # Accept None to mean "no filtering"; otherwise normalize to lowercase set
@@ -164,7 +164,11 @@ class YoloPlantDetectorEngine:
         return self._parse_and_map_results(results, tile_boxes, tiling_engine)
 
     def _run_model_predict(self, tile_crops: Sequence[np.ndarray | Image.Image]) -> list:
-        """Execute model predict call under PyTorch FP16 autocast context if enabled."""
+        """Execute model predict call under PyTorch FP16 autocast context if enabled.
+
+        `stream=True` keeps Ultralytics from accumulating every result in RAM at
+        once, which is important for very large tile batches and long runs.
+        """
         if self._use_fp16:
             with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
                 return self._model.predict(
@@ -173,6 +177,7 @@ class YoloPlantDetectorEngine:
                     iou=self._iou_threshold,
                     device=self._device,
                     batch=self._batch_size,
+                    stream=True,
                     verbose=False,
                 )
         return self._model.predict(
@@ -181,6 +186,7 @@ class YoloPlantDetectorEngine:
             iou=self._iou_threshold,
             device=self._device,
             batch=self._batch_size,
+            stream=True,
             verbose=False,
         )
 
