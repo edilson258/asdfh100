@@ -7,7 +7,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import timedelta
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence, TypeVar
 from uuid import UUID
 
 import cv2
@@ -37,6 +37,7 @@ from pipeline.upload import GcpImageUploader
 
 # Type alias for what the loader stage hands off to the GPU stage.
 _LoadedImage = tuple[ImageRecord, list[TileBox], list["cv2.Mat"]]
+_T = TypeVar("_T")
 
 
 class BatchPipelineOrchestrator:
@@ -94,97 +95,115 @@ class BatchPipelineOrchestrator:
             >>> stats = orchestrator.run_pipeline(dry_run=True, limit=10)
         """
         stats = PipelineProgressStats()
-        run_id = self._repo.create_run(self._settings)
+        run_id: UUID | None = None
+        run_status = "aborted"
 
-        # Apply CPU thread caps to avoid saturating the host. Use configured
-        # max_ram_utilization_pct as the desired utilization ratio for CPU as well.
-        logical_cores = psutil.cpu_count(logical=True) or 1
-        cpu_target_pct = self._settings.max_ram_utilization_pct
-        target_threads = max(1, int(logical_cores * cpu_target_pct))
-        # Leave a small headroom to avoid 100% saturation
-        if target_threads >= logical_cores:
-            target_threads = max(1, logical_cores - 1)
-
-        os.environ.setdefault("OMP_NUM_THREADS", str(target_threads))
-        os.environ.setdefault("MKL_NUM_THREADS", str(target_threads))
         try:
-            torch.set_num_threads(target_threads)
-        except Exception:
-            # ignore if the torch backend doesn't support setting threads
-            pass
+            run_id = self._repo.create_run(self._settings)
 
-        discovered = self._scanner.discover_images(
-            self._settings.input_dir, recursive=self._settings.recursive_scan
-        )
-        if limit is not None and limit > 0:
-            discovered = discovered[:limit]
+            # Apply CPU thread caps to avoid saturating the host. Use configured
+            # max_ram_utilization_pct as the desired utilization ratio for CPU as well.
+            logical_cores = psutil.cpu_count(logical=True) or 1
+            cpu_target_pct = self._settings.max_ram_utilization_pct
+            target_threads = max(1, int(logical_cores * cpu_target_pct))
+            # Leave a small headroom to avoid 100% saturation
+            if target_threads >= logical_cores:
+                target_threads = max(1, logical_cores - 1)
 
-        registered_count = self._repo.register_discovered_images(run_id, discovered)
-        stats.total_images = len(discovered)
-        if registered_count and registered_count != len(discovered):
-            logger.info(
-                f"Registered {registered_count:,} new image(s) out of {len(discovered):,} discovered."
+            os.environ.setdefault("OMP_NUM_THREADS", str(target_threads))
+            os.environ.setdefault("MKL_NUM_THREADS", str(target_threads))
+            try:
+                torch.set_num_threads(target_threads)
+            except Exception:
+                # Ignore if the torch backend doesn't support setting threads.
+                pass
+
+            discovered = self._scanner.discover_images(
+                self._settings.input_dir, recursive=self._settings.recursive_scan
+            )
+            if limit is not None and limit > 0:
+                discovered = discovered[:limit]
+
+            registered_count = self._repo.register_discovered_images(run_id, discovered)
+            stats.total_images = len(discovered)
+            if registered_count and registered_count != len(discovered):
+                logger.info(
+                    f"Registered {registered_count:,} new image(s) out of {len(discovered):,} discovered."
+                )
+
+            # Estimate tiles by sampling up to N images to avoid reading thousands of files.
+            sample_n = min(len(discovered), 50)
+            sample_paths = discovered[:sample_n]
+            total_tiles_sample = 0
+            import cv2 as _cv2
+
+            for p in sample_paths:
+                try:
+                    img = _cv2.imread(str(p))
+                    if img is None:
+                        continue
+                    h, w = img.shape[:2]
+                    total_tiles_sample += len(self._tiling.calculate_tile_grid(w, h))
+                except Exception as exc:
+                    logger.debug(f"Skipping workload sample {p}: {exc}")
+                    continue
+
+            avg_tiles_per_image = (
+                int(total_tiles_sample / sample_n)
+                if sample_n > 0 and total_tiles_sample > 0
+                else 0
+            )
+            est_tiles = (
+                avg_tiles_per_image * len(discovered) if avg_tiles_per_image > 0 else 0
             )
 
-        # Estimate tiles by sampling up to N images to avoid reading thousands of files.
-        sample_n = min(len(discovered), 50)
-        sample_paths = discovered[:sample_n]
-        total_tiles_sample = 0
-        import cv2 as _cv2
+            count_pending = getattr(self._repo, "count_pending_images", None)
+            if callable(count_pending):
+                try:
+                    pending_count = count_pending(
+                        run_id, max_attempts=self._settings.max_attempts_per_image
+                    )
+                except TypeError:
+                    pending_count = count_pending(run_id)
+            else:
+                pending_count = len(discovered)
+            completed_count = max(0, stats.total_images - pending_count)
 
-        for p in sample_paths:
-            try:
-                img = _cv2.imread(str(p))
-                if img is None:
-                    continue
-                h, w = img.shape[:2]
-                total_tiles_sample += len(self._tiling.calculate_tile_grid(w, h))
-            except Exception:
-                continue
+            # Compute ETA based on sampled average tiles and device capability
+            tiles_per_second = 180.0 if torch.cuda.is_available() else 150.0
+            # scale by tile area ratio relative to 640 baseline
+            base_tile = 640
+            scale = (base_tile * base_tile) / max(
+                1, self._settings.tile_size * self._settings.tile_size
+            )
+            tiles_per_second = max(1.0, tiles_per_second * scale)
 
-        avg_tiles_per_image = (
-            int(total_tiles_sample / sample_n)
-            if sample_n > 0 and total_tiles_sample > 0
-            else 0
-        )
-        est_tiles = (
-            avg_tiles_per_image * len(discovered) if avg_tiles_per_image > 0 else 0
-        )
+            total_seconds = int(est_tiles / tiles_per_second) if est_tiles > 0 else 0
+            eta_str = str(timedelta(seconds=total_seconds))
 
-        pending_count = self._repo.count_pending_images(
-            run_id, max_attempts=self._settings.max_attempts_per_image
-        )
-        completed_count = max(0, stats.total_images - pending_count)
+            self._print_pre_run_summary(
+                stats.total_images,
+                completed_count,
+                pending_count,
+                run_id,
+                est_tiles,
+                eta_str,
+            )
 
-        # Compute ETA based on sampled average tiles and device capability
-        tiles_per_second = 180.0 if torch.cuda.is_available() else 15.0
-        # scale by tile area ratio relative to 640 baseline
-        base_tile = 640
-        scale = (base_tile * base_tile) / max(
-            1, self._settings.tile_size * self._settings.tile_size
-        )
-        tiles_per_second = max(1.0, tiles_per_second * scale)
+            if dry_run:
+                logger.info("Dry-run flag set. Skipping inference loop.")
+                run_status = "completed"
+                return stats
 
-        total_seconds = int(est_tiles / tiles_per_second) if est_tiles > 0 else 0
-        eta_str = str(timedelta(seconds=total_seconds))
-
-        self._print_pre_run_summary(
-            stats.total_images,
-            completed_count,
-            pending_count,
-            run_id,
-            est_tiles,
-            eta_str,
-        )
-
-        if dry_run:
-            logger.info("Dry-run flag set. Skipping inference loop.")
-            self._repo.mark_run_status(run_id, "completed")
+            if self._process_image_queue(run_id, stats, total_images=len(discovered)):
+                run_status = "completed"
             return stats
-
-        self._process_image_queue(run_id, stats, total_images=len(discovered))
-        self._repo.mark_run_status(run_id, "completed")
-        return stats
+        except Exception as exc:
+            logger.exception(f"Pipeline run encountered an unrecoverable error: {exc}")
+            return stats
+        finally:
+            if run_id is not None:
+                self._safe_mark_run_status(run_id, run_status)
 
     def _print_pre_run_summary(
         self,
@@ -213,12 +232,16 @@ class BatchPipelineOrchestrator:
         table.add_row("Estimated Total Time (ETA)", eta_str)
         # show sample of discovered files
         table.add_row("Sample Images (first 5)", "")
-        for p in list(
-            self._scanner.discover_images(
-                self._settings.input_dir, recursive=self._settings.recursive_scan
-            )
-        )[:5]:
-            table.add_row("", str(p))
+        try:
+            for p in list(
+                self._scanner.discover_images(
+                    self._settings.input_dir, recursive=self._settings.recursive_scan
+                )
+            )[:5]:
+                table.add_row("", str(p))
+        except Exception as exc:
+            logger.warning(f"Unable to sample images for pre-run summary: {exc}")
+            table.add_row("", "<unable to sample images>")
 
         panel = Panel(
             table,
@@ -254,7 +277,7 @@ class BatchPipelineOrchestrator:
         avg_tiles_per_image = 9
         est_tiles = pending_images * avg_tiles_per_image
 
-        tiles_per_second = 180.0 if torch.cuda.is_available() else 15.0
+        tiles_per_second = 180.0 if torch.cuda.is_available() else 150.0
         total_seconds = int(est_tiles / tiles_per_second) if est_tiles > 0 else 0
 
         eta_formatted = str(timedelta(seconds=total_seconds))
@@ -278,7 +301,7 @@ class BatchPipelineOrchestrator:
 
     def _process_image_queue(
         self, run_id: UUID, stats: PipelineProgressStats, total_images: int
-    ) -> None:
+    ) -> bool:
         """Fetch pending images and run them through the pipeline with the
         load, inference, and post-process stages overlapped across images.
         """
@@ -311,44 +334,62 @@ class BatchPipelineOrchestrator:
             "[cyan]Processing images...", total=stats.total_images
         )
 
-        with self._repo_lock:
-            work_items = self._repo.fetch_pending_images(
-                run_id,
-                batch_size=max(total_images, 1),
-                max_attempts=self._settings.max_attempts_per_image,
-            )
+        try:
+            with self._repo_lock:
+                try:
+                    work_items = self._repo.fetch_pending_images(
+                        run_id,
+                        batch_size=max(total_images, 1),
+                        max_attempts=self._settings.max_attempts_per_image,
+                    )
+                except TypeError:
+                    work_items = self._repo.fetch_pending_images(
+                        run_id, batch_size=max(total_images, 1)
+                    )
+        except Exception as exc:
+            logger.exception(f"Unable to fetch pending images for run {run_id}: {exc}")
+            return False
         record_iter = iter(work_items)
-        pending_futures: "queue.Queue[Future]" = queue.Queue()
+        pending_futures: "queue.Queue[tuple[Future, ImageRecord]]" = queue.Queue()
         postproc_backpressure = threading.BoundedSemaphore(postproc_backlog_limit)
         outstanding_postproc: list[Future] = []
         processed_count = 0
 
         def on_step_done() -> None:
             nonlocal processed_count
-            processed_count += 1
-            with progress_lock:
-                progress.update(task_id, advance=1)
-            # if processed_count % self._settings.ram_check_interval_images == 0:
-            #     self._memory.check_and_throttle()
-            if processed_count % self._settings.ram_check_interval_images == 0:
-                self._memory.check_and_log()
+            try:
+                processed_count += 1
+                with progress_lock:
+                    progress.update(task_id, advance=1)
+                # if processed_count % self._settings.ram_check_interval_images == 0:
+                #     self._memory.check_and_throttle()
+                if processed_count % self._settings.ram_check_interval_images == 0:
+                    self._memory.check_and_log()
+            except Exception as exc:
+                logger.warning(f"Progress or memory-guard update failed: {exc}")
 
-        def make_postproc_callback() -> "callable[[Future], None]":
+        def make_postproc_callback() -> Callable[[Future], None]:
             def _callback(fut: Future) -> None:
+                success = False
                 try:
-                    success = fut.result()
-                except Exception:
-                    success = False
-                with stats_lock:
-                    if success:
-                        stats.succeeded_images += 1
-                    else:
-                        stats.failed_images += 1
-                postproc_backpressure.release()
-                # Advance the bar here -- this is the point at which the
-                # image has *actually* finished (NMS + draw + DB write +
-                # upload), not just been handed off to the postproc pool.
-                on_step_done()
+                    success = bool(fut.result())
+                except Exception as exc:
+                    logger.exception(f"Post-processing future failed: {exc}")
+
+                try:
+                    with stats_lock:
+                        if success:
+                            stats.succeeded_images += 1
+                        else:
+                            stats.failed_images += 1
+                except Exception as exc:
+                    logger.warning(f"Unable to update run stats for postproc result: {exc}")
+                finally:
+                    postproc_backpressure.release()
+                    # Advance the bar here -- this is the point at which the
+                    # image has *actually* finished (NMS + draw + DB write +
+                    # upload), not just been handed off to the postproc pool.
+                    on_step_done()
 
             return _callback
 
@@ -371,7 +412,7 @@ class BatchPipelineOrchestrator:
                 except StopIteration:
                     return False
                 fut = loader_pool.submit(self._load_and_tile_image, img_rec)
-                pending_futures.put(fut)
+                pending_futures.put((fut, img_rec))
                 return True
 
             # Prime the loader window so the GPU has work waiting as soon as
@@ -384,7 +425,7 @@ class BatchPipelineOrchestrator:
                     break
 
             while active > 0:
-                load_future = pending_futures.get()
+                load_future, img_rec = pending_futures.get()
                 active -= 1
 
                 # Immediately backfill the window so loading for future
@@ -392,7 +433,18 @@ class BatchPipelineOrchestrator:
                 if submit_next_load():
                     active += 1
 
-                loaded = load_future.result()
+                try:
+                    loaded = load_future.result()
+                except Exception as exc:
+                    logger.exception(f"Loader stage failed for {img_rec.image_path}: {exc}")
+                    self._safe_mark_image_failed(img_rec.id, str(exc))
+                    with stats_lock:
+                        stats.failed_images += 1
+                    # Failure already recorded if possible. Advance directly
+                    # because this image will never reach post-processing.
+                    on_step_done()
+                    continue
+
                 if loaded is None:
                     # Failure already logged and recorded in the DB by
                     # _load_and_tile_image. This image never reaches
@@ -432,11 +484,22 @@ class BatchPipelineOrchestrator:
                 # is intentionally NOT called here anymore -- it now happens
                 # inside the callback once postproc actually finishes.
                 postproc_backpressure.acquire()
-                pp_future = postproc_pool.submit(
-                    self._postprocess_and_upload, img_rec, raw_detections
-                )
-                pp_future.add_done_callback(make_postproc_callback())
-                outstanding_postproc.append(pp_future)
+                try:
+                    pp_future = postproc_pool.submit(
+                        self._postprocess_and_upload, img_rec, raw_detections
+                    )
+                    pp_future.add_done_callback(make_postproc_callback())
+                    outstanding_postproc.append(pp_future)
+                except Exception as exc:
+                    postproc_backpressure.release()
+                    logger.exception(
+                        f"Failed to queue post-processing for {img_rec.image_path}: {exc}"
+                    )
+                    self._safe_mark_image_failed(img_rec.id, str(exc))
+                    with stats_lock:
+                        stats.failed_images += 1
+                    on_step_done()
+                    continue
 
             # Drain any postproc work still in flight before returning so
             # stats/DB state are fully settled when run_pipeline() returns.
@@ -467,6 +530,7 @@ class BatchPipelineOrchestrator:
 
             if remaining:
                 logger.info("Postproc backlog drained.")
+        return True
 
     def _create_progress_bar(self) -> Progress:
         """Create Rich progress bar instance."""
@@ -486,8 +550,7 @@ class BatchPipelineOrchestrator:
         logging and recording the failure) if the image can't be read.
         """
         try:
-            with self._repo_lock:
-                self._repo.update_image_status(img_rec.id, "processing")
+            self._safe_update_image_status(img_rec.id, "processing")
 
             full_img_bgr = cv2.imread(str(img_rec.image_path))
             if full_img_bgr is None:
@@ -497,14 +560,13 @@ class BatchPipelineOrchestrator:
 
             h, w = full_img_bgr.shape[:2]
             tile_boxes = self._tiling.calculate_tile_grid(w, h)
-            with self._repo_lock:
-                self._repo.update_image_status(
-                    img_rec.id,
-                    "tiling_done",
-                    width=w,
-                    height=h,
-                    tiles_total=len(tile_boxes),
-                )
+            self._safe_update_image_status(
+                img_rec.id,
+                "tiling_done",
+                width=w,
+                height=h,
+                tiles_total=len(tile_boxes),
+            )
 
             tile_crops = self._extract_tile_crops(full_img_bgr, tile_boxes)
             # Release the full-resolution buffer now -- downstream drawing
@@ -515,8 +577,7 @@ class BatchPipelineOrchestrator:
             return img_rec, tile_boxes, tile_crops
         except Exception as exc:
             logger.exception(f"Error loading/tiling image {img_rec.image_path}: {exc}")
-            with self._repo_lock:
-                self._repo.mark_image_failed(img_rec.id, str(exc))
+            self._safe_mark_image_failed(img_rec.id, str(exc))
             return None
 
     def _run_gpu_inference(
@@ -533,8 +594,7 @@ class BatchPipelineOrchestrator:
         raw_detections = self._detector.infer_tile_batch(
             tile_crops, tile_boxes, self._tiling
         )
-        with self._repo_lock:
-            self._repo.update_image_status(img_rec.id, "inference_done")
+        self._safe_update_image_status(img_rec.id, "inference_done")
         return raw_detections
 
     def _postprocess_and_upload(
@@ -564,8 +624,7 @@ class BatchPipelineOrchestrator:
                 self._renderer.render_and_save(
                     img_rec.image_path, annotated_path, merged_detections
                 )
-                with self._repo_lock:
-                    self._repo.update_image_status(img_rec.id, "draw_done")
+                self._safe_update_image_status(img_rec.id, "draw_done")
 
                 # Upload only the annotated full image (not tiles)
                 gcp_url = self._uploader.upload_file(annotated_path)
@@ -577,8 +636,7 @@ class BatchPipelineOrchestrator:
             return True
         except Exception as exc:
             logger.exception(f"Error post-processing image {img_rec.image_path}: {exc}")
-            with self._repo_lock:
-                self._repo.mark_image_failed(img_rec.id, str(exc))
+            self._safe_mark_image_failed(img_rec.id, str(exc))
             return False
 
     def _extract_tile_crops(
@@ -593,3 +651,44 @@ class BatchPipelineOrchestrator:
             ]
             crops.append(crop)
         return crops
+
+    def _safe_update_image_status(
+        self,
+        image_id: int,
+        status: str,
+        width: int | None = None,
+        height: int | None = None,
+        tiles_total: int | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        """Best-effort image status update that never interrupts image processing."""
+        try:
+            with self._repo_lock:
+                self._repo.update_image_status(
+                    image_id,
+                    status,
+                    width=width,
+                    height=height,
+                    tiles_total=tiles_total,
+                    error_message=error_message,
+                )
+        except Exception as exc:
+            logger.warning(
+                f"Failed to update image {image_id} status to '{status}': {exc}"
+            )
+
+    def _safe_mark_image_failed(self, image_id: int, error_message: str) -> None:
+        """Best-effort failure record helper that does not raise."""
+        try:
+            with self._repo_lock:
+                self._repo.mark_image_failed(image_id, error_message)
+        except Exception as exc:
+            logger.warning(f"Failed to mark image {image_id} as failed: {exc}")
+
+    def _safe_mark_run_status(self, run_id: UUID, status: str) -> None:
+        """Best-effort run status update that does not interrupt shutdown."""
+        try:
+            with self._repo_lock:
+                self._repo.mark_run_status(run_id, status)
+        except Exception as exc:
+            logger.warning(f"Failed to mark run {run_id} as {status}: {exc}")
