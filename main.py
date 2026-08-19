@@ -50,6 +50,7 @@ def start(
         iou_threshold=settings.iou_threshold,
         target_classes=settings.detection_classes,
         batch_size=settings.gpu_batch_size,
+        vram_target_pct=settings.gpu_vram_target_pct,
     )
     uploader = GcpImageUploader(
         bucket_name=settings.gcp_bucket,

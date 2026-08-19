@@ -338,6 +338,11 @@ class BatchPipelineOrchestrator:
             except Exception:
                 pass
 
+        def current_gpu_batch_target() -> int:
+            """Use the detector's live batch size so runner batching scales up."""
+            detector_batch = getattr(self._detector, "batch_size", gpu_batch_target)
+            return max(gpu_batch_target, int(detector_batch) * 2)
+
         # Per-future timeout (seconds) used only when draining the final
         # backlog, so a stuck upload/DB call doesn't hang the process
         # forever with no feedback. Configurable via settings; defaults to
@@ -570,7 +575,7 @@ class BatchPipelineOrchestrator:
                 gpu_batch.append(loaded)
                 gpu_batch_tiles += len(loaded[1])
 
-                if gpu_batch_tiles >= gpu_batch_target:
+                if gpu_batch_tiles >= current_gpu_batch_target():
                     _flush_gpu_batch(gpu_batch)
                     gpu_batch = []
                     gpu_batch_tiles = 0

@@ -1,5 +1,6 @@
 """YOLO model inference wrapper for CUDA batch processing."""
 
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Sequence
 import numpy as np
@@ -106,6 +107,7 @@ class YoloPlantDetectorEngine:
         iou_threshold: float = 0.45,
         target_classes: Sequence[str] | None = None,
         batch_size: int = 256,
+        vram_target_pct: float = 0.84,
     ) -> None:
         """Initialize engine and load model into GPU resident memory.
 
@@ -118,21 +120,30 @@ class YoloPlantDetectorEngine:
         self._conf_threshold = conf_threshold
         self._iou_threshold = iou_threshold
         self._batch_size = max(1, batch_size)
+        self._vram_target_pct = min(max(vram_target_pct, 0.5), 0.95)
+        self._gpu_total_memory_bytes = 0
+        self._max_batch_size = 4096
         if "cuda" in resolved_device:
             try:
-                gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (
-                    1024**3
-                )
+                props = torch.cuda.get_device_properties(0)
+                self._gpu_total_memory_bytes = int(props.total_memory)
+                gpu_mem_gb = self._gpu_total_memory_bytes / (1024**3)
+                self._max_batch_size = max(512, min(4096, int(gpu_mem_gb * 32)))
                 if gpu_mem_gb >= 80:
-                    self._batch_size = max(self._batch_size, 512)
+                    self._batch_size = max(self._batch_size, 1024)
                 elif gpu_mem_gb >= 40:
-                    self._batch_size = max(self._batch_size, 256)
+                    self._batch_size = max(self._batch_size, 512)
             except Exception:
                 pass
         # Accept None to mean "no filtering"; otherwise normalize to lowercase set
         self._target_classes = set([t.lower() for t in target_classes]) if target_classes else None
 
         self._model = self._load_yolo_model(weights_path, resolved_device)
+
+    @property
+    def batch_size(self) -> int:
+        """Current inference batch size, which may adapt during long runs."""
+        return self._batch_size
 
     def _load_yolo_model(self, weights_path: Path, device: str) -> YOLO:
         """Load YOLO PyTorch model weights onto target compute device."""
@@ -169,26 +180,70 @@ class YoloPlantDetectorEngine:
         `stream=True` keeps Ultralytics from accumulating every result in RAM at
         once, which is important for very large tile batches and long runs.
         """
-        if self._use_fp16:
-            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-                return self._model.predict(
-                    source=list(tile_crops),
-                    conf=self._conf_threshold,
-                    iou=self._iou_threshold,
-                    device=self._device,
-                    batch=self._batch_size,
-                    stream=True,
-                    verbose=False,
-                )
-        return self._model.predict(
-            source=list(tile_crops),
-            conf=self._conf_threshold,
-            iou=self._iou_threshold,
-            device=self._device,
-            batch=self._batch_size,
-            stream=True,
-            verbose=False,
-        )
+        attempts = 0
+        while True:
+            attempts += 1
+            if self._device.startswith("cuda"):
+                try:
+                    torch.cuda.reset_peak_memory_stats()
+                except Exception:
+                    pass
+
+            autocast_ctx = (
+                torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+                if self._use_fp16
+                else nullcontext()
+            )
+            try:
+                with autocast_ctx:
+                    results = self._model.predict(
+                        source=list(tile_crops),
+                        conf=self._conf_threshold,
+                        iou=self._iou_threshold,
+                        device=self._device,
+                        batch=self._batch_size,
+                        stream=True,
+                        verbose=False,
+                    )
+                    results_list = list(results)
+                self._tune_batch_size_after_success()
+                return results_list
+            except RuntimeError as exc:
+                if "out of memory" not in str(exc).lower() or attempts >= 3:
+                    raise
+                self._handle_cuda_oom()
+
+    def _tune_batch_size_after_success(self) -> None:
+        """Adjust batch size toward a high but safe VRAM occupancy target."""
+        if not self._device.startswith("cuda") or self._gpu_total_memory_bytes <= 0:
+            return
+
+        try:
+            peak_reserved = torch.cuda.max_memory_reserved()
+        except Exception:
+            return
+
+        target_bytes = int(self._gpu_total_memory_bytes * self._vram_target_pct)
+        if target_bytes <= 0:
+            return
+
+        utilization = peak_reserved / target_bytes
+        if utilization < 0.55:
+            self._batch_size = min(self._max_batch_size, max(self._batch_size + 1, int(self._batch_size * 2)))
+        elif utilization < 0.80:
+            self._batch_size = min(self._max_batch_size, max(self._batch_size + 1, int(self._batch_size * 1.5)))
+        elif utilization > 1.00:
+            self._batch_size = max(1, int(self._batch_size * 0.7))
+        elif utilization > 0.92:
+            self._batch_size = max(1, int(self._batch_size * 0.85))
+
+    def _handle_cuda_oom(self) -> None:
+        """Back off the batch size and clear cached VRAM after an OOM."""
+        self._batch_size = max(1, int(self._batch_size * 0.5))
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     def _parse_and_map_results(
         self,
