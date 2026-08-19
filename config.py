@@ -109,19 +109,19 @@ class PipelineSettings(BaseSettings):
         return Path(self.GOOGLE_APPLICATION_CREDENTIALS)
 
     gpu_batch_size: int = Field(
-        default=64,
+        default=640,
         description="Number of tiles sent per GPU inference batch.",
     )
     cpu_preprocess_workers: int = Field(
-        default=16,
+        default=160,
         description="Number of parallel CPU workers for tiling.",
     )
     cpu_postprocess_workers: int = Field(
-        default=8,
+        default=80,
         description="Number of parallel CPU workers for drawing.",
     )
     upload_threads: int = Field(
-        default=16,
+        default=160,
         description="Number of threads for GCP uploads.",
     )
     max_ram_utilization_pct: float = Field(
@@ -129,7 +129,7 @@ class PipelineSettings(BaseSettings):
         description="Target maximum RAM utilization ceiling ratio.",
     )
     ram_check_interval_images: int = Field(
-        default=25,
+        default=250,
         description="Check system RAM every N images.",
     )
 

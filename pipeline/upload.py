@@ -55,7 +55,7 @@ class GcpImageUploader:
         return f"https://storage.googleapis.com/{self._bucket_name}/{key}"
 
     def upload_batch(
-        self, local_paths: Sequence[Path], max_threads: int = 16
+        self, local_paths: Sequence[Path], max_threads: int = 160
     ) -> list[str]:
         """Upload a batch of files concurrently using a ThreadPoolExecutor.
 

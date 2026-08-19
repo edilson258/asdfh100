@@ -105,7 +105,7 @@ class YoloPlantDetectorEngine:
         conf_threshold: float = 0.25,
         iou_threshold: float = 0.45,
         target_classes: Sequence[str] | None = None,
-        batch_size: int = 64,
+        batch_size: int = 640,
     ) -> None:
         """Initialize engine and load model into GPU resident memory.
 
@@ -124,9 +124,9 @@ class YoloPlantDetectorEngine:
                     1024**3
                 )
                 if gpu_mem_gb >= 80:
-                    self._batch_size = max(self._batch_size, 256)
+                    self._batch_size = max(self._batch_size, 2560)
                 elif gpu_mem_gb >= 40:
-                    self._batch_size = max(self._batch_size, 128)
+                    self._batch_size = max(self._batch_size, 1280)
             except Exception:
                 pass
         # Accept None to mean "no filtering"; otherwise normalize to lowercase set
