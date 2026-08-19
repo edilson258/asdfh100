@@ -6,6 +6,7 @@ from typing import Sequence
 import numpy as np
 from PIL import Image
 import torch
+from loguru import logger
 from ultralytics import YOLO
 
 from pipeline.models import DetectionRecord, TileBox
@@ -122,17 +123,17 @@ class YoloPlantDetectorEngine:
         self._batch_size = max(1, batch_size)
         self._vram_target_pct = min(max(vram_target_pct, 0.5), 0.95)
         self._gpu_total_memory_bytes = 0
-        self._max_batch_size = 4096
+        self._max_batch_size = 8192
         if "cuda" in resolved_device:
             try:
                 props = torch.cuda.get_device_properties(0)
                 self._gpu_total_memory_bytes = int(props.total_memory)
                 gpu_mem_gb = self._gpu_total_memory_bytes / (1024**3)
-                self._max_batch_size = max(512, min(4096, int(gpu_mem_gb * 32)))
+                self._max_batch_size = max(1024, min(8192, int(gpu_mem_gb * 64)))
                 if gpu_mem_gb >= 80:
-                    self._batch_size = max(self._batch_size, 1024)
+                    self._batch_size = max(self._batch_size, 1536)
                 elif gpu_mem_gb >= 40:
-                    self._batch_size = max(self._batch_size, 512)
+                    self._batch_size = max(self._batch_size, 768)
             except Exception:
                 pass
         # Accept None to mean "no filtering"; otherwise normalize to lowercase set
@@ -195,17 +196,18 @@ class YoloPlantDetectorEngine:
                 else nullcontext()
             )
             try:
-                with autocast_ctx:
-                    results = self._model.predict(
-                        source=list(tile_crops),
-                        conf=self._conf_threshold,
-                        iou=self._iou_threshold,
-                        device=self._device,
-                        batch=self._batch_size,
-                        stream=True,
-                        verbose=False,
-                    )
-                    results_list = list(results)
+                with torch.inference_mode():
+                    with autocast_ctx:
+                        results = self._model.predict(
+                            source=list(tile_crops),
+                            conf=self._conf_threshold,
+                            iou=self._iou_threshold,
+                            device=self._device,
+                            batch=self._batch_size,
+                            stream=True,
+                            verbose=False,
+                        )
+                        results_list = list(results)
                 self._tune_batch_size_after_success()
                 return results_list
             except RuntimeError as exc:
@@ -228,14 +230,34 @@ class YoloPlantDetectorEngine:
             return
 
         utilization = peak_reserved / target_bytes
+        previous_batch = self._batch_size
         if utilization < 0.55:
-            self._batch_size = min(self._max_batch_size, max(self._batch_size + 1, int(self._batch_size * 2)))
+            self._batch_size = min(
+                self._max_batch_size, max(self._batch_size + 1, int(self._batch_size * 1.75))
+            )
         elif utilization < 0.80:
-            self._batch_size = min(self._max_batch_size, max(self._batch_size + 1, int(self._batch_size * 1.5)))
+            self._batch_size = min(
+                self._max_batch_size, max(self._batch_size + 1, int(self._batch_size * 1.25))
+            )
         elif utilization > 1.00:
-            self._batch_size = max(1, int(self._batch_size * 0.7))
-        elif utilization > 0.92:
+            self._batch_size = max(1, int(self._batch_size * 0.65))
+        elif utilization > 0.94:
             self._batch_size = max(1, int(self._batch_size * 0.85))
+
+        if self._batch_size != previous_batch:
+            logger.info(
+                f"GPU batch adjusted: batch_size={self._batch_size} "
+                f"peak_vram={peak_reserved / (1024**3):.1f}GB "
+                f"target={target_bytes / (1024**3):.1f}GB "
+                f"util={utilization * 100.0:.1f}%"
+            )
+        else:
+            logger.debug(
+                f"GPU batch steady: batch_size={self._batch_size} "
+                f"peak_vram={peak_reserved / (1024**3):.1f}GB "
+                f"target={target_bytes / (1024**3):.1f}GB "
+                f"util={utilization * 100.0:.1f}%"
+            )
 
     def _handle_cuda_oom(self) -> None:
         """Back off the batch size and clear cached VRAM after an OOM."""

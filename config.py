@@ -113,7 +113,7 @@ class PipelineSettings(BaseSettings):
         description="Number of tiles sent per GPU inference batch.",
     )
     gpu_vram_target_pct: float = Field(
-        default=0.84,
+        default=0.90,
         description="Target fraction of GPU VRAM to occupy during inference.",
     )
     cpu_preprocess_workers: int = Field(
