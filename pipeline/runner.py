@@ -3,11 +3,12 @@
 import os
 import queue
 import threading
+from dataclasses import replace
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import timedelta
 from pathlib import Path
-from typing import Callable, Sequence, TypeVar
+from typing import Callable, Sequence
 from uuid import UUID
 
 import cv2
@@ -37,7 +38,6 @@ from pipeline.upload import GcpImageUploader
 
 # Type alias for what the loader stage hands off to the GPU stage.
 _LoadedImage = tuple[ImageRecord, list[TileBox], list["cv2.Mat"]]
-_T = TypeVar("_T")
 
 
 class BatchPipelineOrchestrator:
@@ -313,14 +313,30 @@ class BatchPipelineOrchestrator:
         # right now: falls back to sensible CPU-derived defaults if the
         # settings object doesn't define these fields.
         cpu_count = os.cpu_count() or 4
-        num_loader_workers = getattr(self._settings, "loader_workers", None) or max(
-            2, min(8, cpu_count)
+        num_loader_workers = (
+            getattr(self._settings, "cpu_preprocess_workers", None)
+            or getattr(self._settings, "loader_workers", None)
+            or max(8, min(32, cpu_count * 2))
         )
-        num_postproc_workers = getattr(
-            self._settings, "postprocess_workers", None
-        ) or max(2, min(8, cpu_count))
-        window_size = max(2, num_loader_workers * 2)
-        postproc_backlog_limit = num_postproc_workers * 4
+        num_postproc_workers = (
+            getattr(self._settings, "cpu_postprocess_workers", None)
+            or getattr(self._settings, "postprocess_workers", None)
+            or max(8, min(24, cpu_count))
+        )
+        window_size = max(8, num_loader_workers * 4)
+        postproc_backlog_limit = max(16, num_postproc_workers * 6)
+        gpu_batch_target = max(1, getattr(self._settings, "gpu_batch_size", 64))
+        if torch.cuda.is_available():
+            try:
+                gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (
+                    1024**3
+                )
+                if gpu_mem_gb >= 80:
+                    gpu_batch_target = max(gpu_batch_target, 256)
+                elif gpu_mem_gb >= 40:
+                    gpu_batch_target = max(gpu_batch_target, 128)
+            except Exception:
+                pass
 
         # Per-future timeout (seconds) used only when draining the final
         # backlog, so a stuck upload/DB call doesn't hang the process
@@ -354,6 +370,8 @@ class BatchPipelineOrchestrator:
         postproc_backpressure = threading.BoundedSemaphore(postproc_backlog_limit)
         outstanding_postproc: list[Future] = []
         processed_count = 0
+        gpu_batch: list[_LoadedImage] = []
+        gpu_batch_tiles = 0
 
         def on_step_done() -> None:
             nonlocal processed_count
@@ -392,6 +410,100 @@ class BatchPipelineOrchestrator:
                     on_step_done()
 
             return _callback
+
+        def _submit_postproc(
+            img_rec: ImageRecord, raw_detections: list
+        ) -> None:
+            """Queue image post-processing with bounded backpressure."""
+            postproc_backpressure.acquire()
+            try:
+                pp_future = postproc_pool.submit(
+                    self._postprocess_and_upload, img_rec, raw_detections
+                )
+                pp_future.add_done_callback(make_postproc_callback())
+                outstanding_postproc.append(pp_future)
+            except Exception as exc:
+                postproc_backpressure.release()
+                logger.exception(
+                    f"Failed to queue post-processing for {img_rec.image_path}: {exc}"
+                )
+                self._safe_mark_image_failed(img_rec.id, str(exc))
+                with stats_lock:
+                    stats.failed_images += 1
+                on_step_done()
+
+        def _flush_gpu_batch(batch: list[_LoadedImage]) -> None:
+            """Run batched inference across multiple images when possible."""
+            if not batch:
+                return
+
+            if len(batch) == 1:
+                img_rec, tile_boxes, tile_crops = batch[0]
+                try:
+                    raw_detections = self._run_gpu_inference(
+                        img_rec, tile_crops, tile_boxes
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        f"GPU inference failed for {img_rec.image_path}: {exc}"
+                    )
+                    self._safe_mark_image_failed(img_rec.id, str(exc))
+                    with stats_lock:
+                        stats.failed_images += 1
+                    on_step_done()
+                    return
+
+                _submit_postproc(img_rec, raw_detections)
+                return
+
+            flat_tile_crops: list[cv2.Mat] = []
+            flat_tile_boxes: list[TileBox] = []
+            tile_owner: list[int] = []
+            for image_idx, (_img_rec, tile_boxes, tile_crops) in enumerate(batch):
+                for tile_box, tile_crop in zip(tile_boxes, tile_crops):
+                    flat_tile_crops.append(tile_crop)
+                    flat_tile_boxes.append(
+                        replace(tile_box, tile_index=len(flat_tile_boxes))
+                    )
+                    tile_owner.append(image_idx)
+
+            try:
+                flat_detections = self._detector.infer_tile_batch(
+                    flat_tile_crops, flat_tile_boxes, self._tiling
+                )
+                detections_by_image: list[list] = [[] for _ in batch]
+                for det in flat_detections:
+                    if det.tile_index is None:
+                        continue
+                    owner_idx = tile_owner[det.tile_index]
+                    detections_by_image[owner_idx].append(det)
+
+                for (img_rec, _tile_boxes, _tile_crops), detections in zip(
+                    batch, detections_by_image
+                ):
+                    self._safe_update_image_status(img_rec.id, "inference_done")
+                    _submit_postproc(img_rec, detections)
+                return
+            except Exception as exc:
+                logger.exception(
+                    f"GPU batch inference failed for {len(batch)} image(s): {exc}"
+                )
+                # Fall back to single-image inference so one bad image or
+                # transient GPU fault does not discard the whole batch.
+                for img_rec, tile_boxes, tile_crops in batch:
+                    try:
+                        raw_detections = self._run_gpu_inference(
+                            img_rec, tile_crops, tile_boxes
+                        )
+                        _submit_postproc(img_rec, raw_detections)
+                    except Exception as image_exc:
+                        logger.exception(
+                            f"GPU inference failed for {img_rec.image_path}: {image_exc}"
+                        )
+                        self._safe_mark_image_failed(img_rec.id, str(image_exc))
+                        with stats_lock:
+                            stats.failed_images += 1
+                        on_step_done()
 
         with (
             progress,
@@ -455,51 +567,18 @@ class BatchPipelineOrchestrator:
                     on_step_done()
                     continue
 
-                img_rec, tile_boxes, tile_crops = loaded
+                gpu_batch.append(loaded)
+                gpu_batch_tiles += len(loaded[1])
 
-                # GPU inference is kept strictly on the main thread so CUDA
-                # calls stay sequential and back-to-back -- this avoids
-                # cross-thread CUDA context contention while the loader and
-                # postproc pools keep everything else overlapped around it.
-                try:
-                    raw_detections = self._run_gpu_inference(
-                        img_rec, tile_crops, tile_boxes
-                    )
-                except Exception as exc:
-                    logger.exception(
-                        f"GPU inference failed for {img_rec.image_path}: {exc}"
-                    )
-                    with self._repo_lock:
-                        self._repo.mark_image_failed(img_rec.id, str(exc))
-                    with stats_lock:
-                        stats.failed_images += 1
-                    # Also terminal for this image without reaching
-                    # postproc, so advance directly.
-                    on_step_done()
-                    continue
+                if gpu_batch_tiles >= gpu_batch_target:
+                    _flush_gpu_batch(gpu_batch)
+                    gpu_batch = []
+                    gpu_batch_tiles = 0
 
-                # Hand NMS + draw + DB write + upload off to the postproc
-                # pool so the GPU can move straight to the next image
-                # instead of waiting on disk/network I/O. NOTE: on_step_done()
-                # is intentionally NOT called here anymore -- it now happens
-                # inside the callback once postproc actually finishes.
-                postproc_backpressure.acquire()
-                try:
-                    pp_future = postproc_pool.submit(
-                        self._postprocess_and_upload, img_rec, raw_detections
-                    )
-                    pp_future.add_done_callback(make_postproc_callback())
-                    outstanding_postproc.append(pp_future)
-                except Exception as exc:
-                    postproc_backpressure.release()
-                    logger.exception(
-                        f"Failed to queue post-processing for {img_rec.image_path}: {exc}"
-                    )
-                    self._safe_mark_image_failed(img_rec.id, str(exc))
-                    with stats_lock:
-                        stats.failed_images += 1
-                    on_step_done()
-                    continue
+            if gpu_batch:
+                _flush_gpu_batch(gpu_batch)
+                gpu_batch = []
+                gpu_batch_tiles = 0
 
             # Drain any postproc work still in flight before returning so
             # stats/DB state are fully settled when run_pipeline() returns.

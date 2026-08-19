@@ -22,6 +22,7 @@ def resolve_best_compute_device(requested_device: str = "cuda:0") -> str:
     if "cuda" in requested_device:
         device = _try_cuda_device_strategies(requested_device)
         if device != "cpu":
+            _optimize_cuda_runtime()
             return device
 
     if "mps" in requested_device or _is_mps_available():
@@ -64,6 +65,29 @@ def _is_mps_available() -> bool:
     return bool(mps_backend and mps_backend.is_available())
 
 
+def _optimize_cuda_runtime() -> None:
+    """Enable conservative CUDA runtime optimizations for fixed-size tiling."""
+    try:
+        torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
+
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+    except Exception:
+        pass
+
+    try:
+        torch.backends.cudnn.allow_tf32 = True
+    except Exception:
+        pass
+
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+
 class YoloPlantDetectorEngine:
     """Ultralytics YOLO wrapper optimizing batch inference on RTX 5090 / H100 GPUs.
 
@@ -81,6 +105,7 @@ class YoloPlantDetectorEngine:
         conf_threshold: float = 0.25,
         iou_threshold: float = 0.45,
         target_classes: Sequence[str] | None = None,
+        batch_size: int = 64,
     ) -> None:
         """Initialize engine and load model into GPU resident memory.
 
@@ -92,6 +117,18 @@ class YoloPlantDetectorEngine:
         self._use_fp16 = use_fp16 and "cuda" in resolved_device
         self._conf_threshold = conf_threshold
         self._iou_threshold = iou_threshold
+        self._batch_size = max(1, batch_size)
+        if "cuda" in resolved_device:
+            try:
+                gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (
+                    1024**3
+                )
+                if gpu_mem_gb >= 80:
+                    self._batch_size = max(self._batch_size, 256)
+                elif gpu_mem_gb >= 40:
+                    self._batch_size = max(self._batch_size, 128)
+            except Exception:
+                pass
         # Accept None to mean "no filtering"; otherwise normalize to lowercase set
         self._target_classes = set([t.lower() for t in target_classes]) if target_classes else None
 
@@ -135,6 +172,7 @@ class YoloPlantDetectorEngine:
                     conf=self._conf_threshold,
                     iou=self._iou_threshold,
                     device=self._device,
+                    batch=self._batch_size,
                     verbose=False,
                 )
         return self._model.predict(
@@ -142,6 +180,7 @@ class YoloPlantDetectorEngine:
             conf=self._conf_threshold,
             iou=self._iou_threshold,
             device=self._device,
+            batch=self._batch_size,
             verbose=False,
         )
 
